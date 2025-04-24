@@ -12,24 +12,36 @@ const pool = new Pool({
     port: process.env.DB_PORT || 5432,
 });
 
+// Cache for IP geolocation
+const ipLocationCache = new Map();
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
 // Enable pg_trgm extension and test connection
-pool.connect((err, client, release) => {
-    if (err) {
-        console.error('Error connecting to the database:', err);
-        return;
-    }
-    console.log('Successfully connected to the database');
-    
-    // Enable pg_trgm extension if not already enabled
-    client.query('CREATE EXTENSION IF NOT EXISTS pg_trgm', (err) => {
-        if (err) {
-            console.error('Error enabling pg_trgm extension:', err);
-        } else {
-            console.log('pg_trgm extension enabled');
+(async () => {
+    try {
+        const client = await pool.connect();
+        try {
+            // Enable pg_trgm extension
+            await client.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+            
+            // Create optimized indexes
+            await client.query(`
+                CREATE INDEX IF NOT EXISTS idx_cities_exact_match ON cities (LOWER(city_name));
+                
+                CREATE INDEX IF NOT EXISTS idx_cities_fuzzy_search ON cities 
+                USING gin (LOWER(city_name) gin_trgm_ops);
+                
+                CREATE INDEX IF NOT EXISTS idx_cities_population ON cities (population DESC);
+            `);
+            
+            console.log('Database connection successful and indexes created');
+        } finally {
+            client.release();
         }
-        release();
-    });
-});
+    } catch (error) {
+        console.error('Error connecting to database:', error);
+    }
+})();
 
 // Helper function to calculate distance between two points using Haversine formula
 function calculateDistance(lat1, lon1, lat2, lon2) {
@@ -123,19 +135,29 @@ function calculateTextMatchScore(cityName, query) {
     return 0.2;
 }
 
-// Function to get location from IP using IP-API
+// Function to get location from IP using IP-API with caching
 function getLocationFromIP(ip) {
     return new Promise((resolve) => {
         // Remove IPv6 prefix if present
         ip = ip.replace('::ffff:', '');
         
+        // Check cache first
+        const cached = ipLocationCache.get(ip);
+        if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+            console.log('Using cached location for IP:', ip);
+            resolve(cached.location);
+            return;
+        }
+        
         // For local development, use a default location
         if (ip === '127.0.0.1' || ip.startsWith('172.') || ip.startsWith('192.168.')) {
             console.log('Using default location for local IP:', ip);
-            resolve({
+            const defaultLocation = {
                 lat: 50.6333,  // Default to Lille, France
                 lon: 3.0667
-            });
+            };
+            ipLocationCache.set(ip, { location: defaultLocation, timestamp: Date.now() });
+            resolve(defaultLocation);
             return;
         }
 
@@ -155,33 +177,41 @@ function getLocationFromIP(ip) {
                     const result = JSON.parse(data);
                     if (result && result.lat && result.lon) {
                         console.log('Location found:', result);
-                        resolve({
+                        const location = {
                             lat: result.lat,
                             lon: result.lon
-                        });
+                        };
+                        ipLocationCache.set(ip, { location, timestamp: Date.now() });
+                        resolve(location);
                     } else {
                         console.log('No location data in response, using default location');
-                        resolve({
-                            lat: 50.6333,  // Default to Lille, France
+                        const defaultLocation = {
+                            lat: 50.6333,
                             lon: 3.0667
-                        });
+                        };
+                        ipLocationCache.set(ip, { location: defaultLocation, timestamp: Date.now() });
+                        resolve(defaultLocation);
                     }
                 } catch (error) {
                     console.error('Error parsing location response, using default location');
-                    resolve({
-                        lat: 50.6333,  // Default to Lille, France
+                    const defaultLocation = {
+                        lat: 50.6333,
                         lon: 3.0667
-                    });
+                    };
+                    ipLocationCache.set(ip, { location: defaultLocation, timestamp: Date.now() });
+                    resolve(defaultLocation);
                 }
             });
         });
 
         req.on('error', (error) => {
             console.error('Error getting location, using default location:', error);
-            resolve({
-                lat: 50.6333,  // Default to Lille, France
+            const defaultLocation = {
+                lat: 50.6333,
                 lon: 3.0667
-            });
+            };
+            ipLocationCache.set(ip, { location: defaultLocation, timestamp: Date.now() });
+            resolve(defaultLocation);
         });
 
         req.end();
@@ -189,136 +219,112 @@ function getLocationFromIP(ip) {
 }
 
 router.get('/', async (req, res) => {
-    const { query, page = 1, limit = 10 } = req.query;
+    const startTime = process.hrtime();
+    const { query, offset = 0, useLocation = false } = req.query;
+    const limit = 10; // Fixed limit of 10 results per page
     
     if (!query) {
-        return res.status(400).json({
-            error: 'Query parameter is required'
-        });
+        return res.status(400).json({ error: 'Query parameter is required' });
     }
 
     try {
-        // Get user's location from IP
+        // Get user's location from IP only if requested
         let userLocation = null;
-        try {
-            // Get the real IP address (considering proxy headers)
+        if (useLocation === 'true') {
             const userIp = req.headers['x-forwarded-for'] || req.ip || req.connection.remoteAddress;
-            console.log('Detected IP:', userIp);
-            
             userLocation = await getLocationFromIP(userIp);
-            if (userLocation) {
-                console.log('Detected location:', userLocation);
-            } else {
-                console.log('Could not detect location from IP');
-            }
-        } catch (error) {
-            console.error('Error in IP geolocation:', error);
         }
 
-        // If no location found, use a neutral score for distance
-        const useDistanceScoring = !!userLocation;
-
-        // Get total count for pagination
-        const countQuery = `
-            SELECT COUNT(*) 
-            FROM cities 
-            WHERE LOWER(city_name) LIKE LOWER($1)
-        `;
-        const countResult = await pool.query(countQuery, [`%${query}%`]);
-        const totalResults = parseInt(countResult.rows[0].count);
-
-        // Get max population for normalization
-        const maxPopQuery = `SELECT MAX(population) FROM cities`;
-        const maxPopResult = await pool.query(maxPopQuery);
-        const maxPopulation = maxPopResult.rows[0].max;
-
-        // Get initial results
+        // Optimized query with pagination
         const searchQuery = `
+            WITH search_results AS (
+                SELECT 
+                    c.*,
+                    CASE 
+                        WHEN LOWER(c.city_name) = LOWER($1) THEN 1.0
+                        WHEN LOWER(c.city_name) LIKE LOWER($1) || '%' THEN 0.9
+                        WHEN LOWER(c.city_name) LIKE '%' || LOWER($1) || '%' THEN 0.8
+                        ELSE 0.0
+                    END as match_score,
+                    CASE 
+                        WHEN $2::float IS NOT NULL AND $3::float IS NOT NULL 
+                        THEN point($2::float, $3::float) <-> point(c.latitude::float, c.longitude::float)
+                        ELSE NULL
+                    END as distance
+                FROM cities c
+                WHERE LOWER(c.city_name) LIKE '%' || LOWER($1) || '%'
+                ORDER BY 
+                    match_score DESC,
+                    c.population DESC NULLS LAST,
+                    distance ASC NULLS LAST
+                LIMIT $4 OFFSET $5
+            )
             SELECT 
-                geoname_id,
-                city_name,
-                country_code,
-                state_code,
-                state_name,
-                latitude,
-                longitude,
-                population,
-                similarity(LOWER(city_name), LOWER($1)) as similarity_score,
-                CASE 
-                    WHEN LOWER(city_name) = LOWER($1) THEN 1.0
-                    ELSE similarity(LOWER(city_name), LOWER($1))
-                END as match_score
-            FROM cities 
-            WHERE similarity(LOWER(city_name), LOWER($1)) > 0.3
-            ORDER BY 
-                match_score DESC,
-                population DESC
-            LIMIT $2 OFFSET $3
+                *,
+                (SELECT COUNT(*) FROM cities 
+                 WHERE LOWER(city_name) LIKE '%' || LOWER($1) || '%') as total_count
+            FROM search_results;
         `;
 
-        const offset = (page - 1) * limit;
         const searchResults = await pool.query(searchQuery, [
             query,
-            limit * 2,
+            userLocation?.lat || null,
+            userLocation?.lon || null,
+            limit,
             offset
         ]);
 
         // Calculate scores and sort
         const scoredResults = searchResults.rows.map(city => {
-            const populationScore = normalizePopulation(city.population, maxPopulation);
+            const populationScore = normalizePopulation(city.population, 10000000);
             const textMatchScore = city.match_score;
-            
-            // Calculate distance score if we have user location
-            let distanceScore = 0.5; // Neutral score if no location
-            let distance = null;
-            
-            if (userLocation) {
-                distance = calculateDistance(
-                    userLocation.lat,
-                    userLocation.lon,
-                    parseFloat(city.latitude),
-                    parseFloat(city.longitude)
-                );
-                // Normalize distance score with better scaling for local results
-                // Cities within 50km get full score, gradually decreasing to 0 at 1000km
-                distanceScore = Math.max(0, 1 - (distance / 1000));
-                console.log(`Distance to ${city.city_name}: ${distance.toFixed(2)}km, score: ${distanceScore.toFixed(2)}`);
-            }
+            const distanceScore = city.distance ? Math.max(0, 1 - (city.distance / 1000)) : 0.5;
 
-            // Weighted scoring with adjusted weights
             const finalScore = 
                 (populationScore * 0.2) + 
                 (textMatchScore * 0.7) + 
                 (distanceScore * 0.1);
 
             return {
-                ...city,
-                score: finalScore || 0, // Ensure we never return null
-                debug: {
-                    populationScore: populationScore || 0, // Ensure we never return null
-                    textMatchScore,
-                    distanceScore,
-                    distance: distance ? distance.toFixed(2) : null,
-                    userLocation,
-                    useDistanceScoring
-                }
+                geoname_id: city.geoname_id,
+                city_name: city.city_name,
+                country_code: city.country_code,
+                state_code: city.state_code,
+                state_name: city.state_name,
+                latitude: city.latitude,
+                longitude: city.longitude,
+                population: city.population,
+                score: finalScore || 0,
+                ...(useLocation === 'true' ? {
+                    debug: {
+                        populationScore: populationScore || 0,
+                        textMatchScore,
+                        distanceScore,
+                        distance: city.distance ? city.distance.toFixed(2) : null,
+                        userLocation,
+                        useDistanceScoring: !!userLocation
+                    }
+                } : {})
             };
         });
 
-        // Sort by final score and take top results
-        const sortedResults = scoredResults
-            .sort((a, b) => b.score - a.score)
-            .slice(0, limit);
+        // Sort by final score
+        const sortedResults = scoredResults.sort((a, b) => b.score - a.score);
 
-        res.json({
+        const response = {
             data: sortedResults,
             pagination: {
-                currentPage: parseInt(page),
-                totalPages: Math.ceil(totalResults / limit),
-                totalResults: totalResults,
-                resultsPerPage: parseInt(limit)
+                offset: parseInt(offset),
+                limit: limit,
+                total: searchResults.rows[0]?.total_count || 0,
+                hasMore: (parseInt(offset) + limit) < (searchResults.rows[0]?.total_count || 0)
+            },
+            debug: {
+                requestTime: `${(process.hrtime(startTime)[0] * 1000 + process.hrtime(startTime)[1] / 1000000).toFixed(2)}ms`
             }
-        });
+        };
+
+        res.json(response);
     } catch (error) {
         console.error('Database error:', error);
         res.status(500).json({

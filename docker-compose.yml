@@ -23,6 +23,7 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    command: postgres -c shared_buffers=2GB
 
   # Node.js application
   app:

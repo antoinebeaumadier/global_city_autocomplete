@@ -23,11 +23,12 @@ CREATE TABLE IF NOT EXISTS cities (
 
 -- Create indexes for fast querying
 CREATE INDEX IF NOT EXISTS idx_city_name ON cities (city_name);
+CREATE INDEX IF NOT EXISTS idx_cities_name_trgm ON cities USING gin (city_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_country_code ON cities (country_code);
 CREATE INDEX IF NOT EXISTS idx_state_code ON cities (state_code);
 CREATE INDEX IF NOT EXISTS idx_state_name ON cities (state_name);
 CREATE INDEX IF NOT EXISTS idx_coordinates ON cities (latitude, longitude);
-CREATE INDEX IF NOT EXISTS idx_population ON cities (population);
+CREATE INDEX IF NOT EXISTS idx_cities_population ON cities (population DESC);
 
 \echo 'Index créés'
 
