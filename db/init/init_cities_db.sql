@@ -2,6 +2,11 @@
 
 \echo 'Début de l''initialisation de la base de données'
 
+-- Drop existing objects if they exist
+DROP TABLE IF EXISTS cities CASCADE;
+
+\echo 'Objets existants supprimés'
+
 -- Create the cities table if it doesn't exist
 CREATE TABLE IF NOT EXISTS cities (
     geoname_id INTEGER PRIMARY KEY,
@@ -27,11 +32,14 @@ CREATE INDEX IF NOT EXISTS idx_population ON cities (population);
 \echo 'Index créés'
 
 -- Import data from the mounted data file
+\echo 'Starting data import...'
+\set ON_ERROR_STOP on
+BEGIN;
 COPY cities(geoname_id, city_name, country_code, state_code, state_name, latitude, longitude, population) 
 FROM '/docker-entrypoint-initdb.d/data/cities_data.txt' 
 WITH DELIMITER E'\t' CSV HEADER;
-
-\echo 'Données importées'
+COMMIT;
+\echo 'Data import completed'
 
 -- Set up user permissions if needed
 -- GRANT SELECT ON cities TO app_user;
@@ -56,4 +64,3 @@ ORDER BY c.population DESC;
 -- Add a comment to the table for documentation
 COMMENT ON TABLE cities IS 'Contains global city data with geographic coordinates and administrative divisions';
 
-\echo 'Initialisation terminée'
