@@ -12,14 +12,23 @@ const pool = new Pool({
     port: process.env.DB_PORT || 5432,
 });
 
-// Test database connection
+// Enable pg_trgm extension and test connection
 pool.connect((err, client, release) => {
     if (err) {
         console.error('Error connecting to the database:', err);
         return;
     }
     console.log('Successfully connected to the database');
-    release();
+    
+    // Enable pg_trgm extension if not already enabled
+    client.query('CREATE EXTENSION IF NOT EXISTS pg_trgm', (err) => {
+        if (err) {
+            console.error('Error enabling pg_trgm extension:', err);
+        } else {
+            console.log('pg_trgm extension enabled');
+        }
+        release();
+    });
 });
 
 // Helper function to calculate distance between two points using Haversine formula
@@ -37,6 +46,7 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 
 // Helper function to normalize population score (0-1)
 function normalizePopulation(population, maxPopulation) {
+    if (!population || population === 0) return 0;
     return Math.log10(population) / Math.log10(maxPopulation);
 }
 
@@ -61,14 +71,51 @@ function calculateTextMatchScore(cityName, query) {
     // City name contains query as part of a word
     if (cityLower.includes(queryLower)) return 0.6;
     
-    // Fuzzy match (for similar names)
+    // Calculate Levenshtein distance for fuzzy matching
+    function levenshteinDistance(a, b) {
+        if (a.length === 0) return b.length;
+        if (b.length === 0) return a.length;
+        
+        const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
+        
+        for (let i = 0; i <= a.length; i++) matrix[0][i] = i;
+        for (let j = 0; j <= b.length; j++) matrix[j][0] = j;
+        
+        for (let j = 1; j <= b.length; j++) {
+            for (let i = 1; i <= a.length; i++) {
+                const substitutionCost = a[i - 1] === b[j - 1] ? 0 : 1;
+                matrix[j][i] = Math.min(
+                    matrix[j][i - 1] + 1,
+                    matrix[j - 1][i] + 1,
+                    matrix[j - 1][i - 1] + substitutionCost
+                );
+            }
+        }
+        
+        return matrix[b.length][a.length];
+    }
+    
+    // Check for fuzzy matches using Levenshtein distance
+    const maxDistance = Math.max(2, Math.floor(queryLower.length * 0.3)); // Allow up to 30% of query length as distance
+    const distance = levenshteinDistance(cityLower, queryLower);
+    
+    if (distance <= maxDistance) {
+        // Calculate similarity score based on distance
+        const similarity = 1 - (distance / Math.max(cityLower.length, queryLower.length));
+        return 0.4 + (similarity * 0.2); // Score between 0.4 and 0.6 for fuzzy matches
+    }
+    
+    // Check if any word starts with any query word
     const words = cityLower.split(/\s+/);
     const queryWords = queryLower.split(/\s+/);
     
-    // Check if any word starts with any query word
     for (const word of words) {
         for (const queryWord of queryWords) {
             if (word.startsWith(queryWord)) return 0.5;
+            // Check for fuzzy word matches
+            if (levenshteinDistance(word, queryWord) <= Math.max(2, Math.floor(queryWord.length * 0.3))) {
+                return 0.4;
+            }
         }
     }
     
@@ -195,33 +242,31 @@ router.get('/', async (req, res) => {
                 state_name,
                 latitude,
                 longitude,
-                population
-            FROM cities 
-            WHERE LOWER(city_name) LIKE LOWER($1) OR LOWER(city_name) LIKE LOWER($2)
-            ORDER BY 
+                population,
+                similarity(LOWER(city_name), LOWER($1)) as similarity_score,
                 CASE 
-                    WHEN LOWER(city_name) = LOWER($3) THEN 1
-                    WHEN LOWER(city_name) LIKE LOWER($4) THEN 2
-                    ELSE 3
-                END,
+                    WHEN LOWER(city_name) = LOWER($1) THEN 1.0
+                    ELSE similarity(LOWER(city_name), LOWER($1))
+                END as match_score
+            FROM cities 
+            WHERE similarity(LOWER(city_name), LOWER($1)) > 0.3
+            ORDER BY 
+                match_score DESC,
                 population DESC
-            LIMIT $5 OFFSET $6
+            LIMIT $2 OFFSET $3
         `;
 
         const offset = (page - 1) * limit;
         const searchResults = await pool.query(searchQuery, [
-            `%${query}%`,
-            `${query}%`,
             query,
-            `${query}%`,
-            limit * 2, // Get more results to sort
+            limit * 2,
             offset
         ]);
 
         // Calculate scores and sort
         const scoredResults = searchResults.rows.map(city => {
             const populationScore = normalizePopulation(city.population, maxPopulation);
-            const textMatchScore = calculateTextMatchScore(city.city_name, query);
+            const textMatchScore = city.match_score;
             
             // Calculate distance score if we have user location
             let distanceScore = 0.5; // Neutral score if no location
@@ -242,15 +287,15 @@ router.get('/', async (req, res) => {
 
             // Weighted scoring with adjusted weights
             const finalScore = 
-                (populationScore * 0.3) + 
-                (textMatchScore * 0.5) + 
-                (distanceScore * 0.2);
+                (populationScore * 0.2) + 
+                (textMatchScore * 0.7) + 
+                (distanceScore * 0.1);
 
             return {
                 ...city,
-                score: finalScore,
+                score: finalScore || 0, // Ensure we never return null
                 debug: {
-                    populationScore,
+                    populationScore: populationScore || 0, // Ensure we never return null
                     textMatchScore,
                     distanceScore,
                     distance: distance ? distance.toFixed(2) : null,
