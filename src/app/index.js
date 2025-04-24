@@ -5,6 +5,9 @@ const NodeCache = require('node-cache');
 const session = require('express-session');
 const app = express();
 
+// Import routes
+const cityAutocompleteRouter = require('./routes/city-autocomplete');
+
 const PORT = process.env.PORT || 3000;
 
 // Token storage
@@ -28,6 +31,9 @@ app.use(session({
     resave: false,
     saveUninitialized: true
 }));
+
+// Mount routes
+app.use('/api/cities', cityAutocompleteRouter);
 
 // Build authorization URL
 const authUrl = 'https://app.hubspot.com/oauth/authorize' +
