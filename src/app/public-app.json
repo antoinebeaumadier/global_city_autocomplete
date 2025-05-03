@@ -16,13 +16,11 @@
     "supportPhone": "+18005555555"
   },
   "extensions": {
-    "crm": {
-      "cards": [
-        {
-          "file": "./extensions/example-card.json"
-        }
-      ]
-    }
+    "formFields": [
+      {
+        "file": "./extensions/city-search-field.json"
+      }
+    ]
   },
   "webhooks": {
     "file": "./webhooks/webhooks.json"
