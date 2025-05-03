@@ -1,0 +1,19 @@
+{
+  "type": "form-field",
+  "data": {
+    "title": "City Search Field",
+    "uid": "city-search-field",
+    "location": "form.field",
+    "module": {
+      "file": "CitySearchField.jsx"
+    },
+    "fieldTypes": [
+      "text"
+    ],
+    "settings": {
+      "placeholder": "Search for a city...",
+      "minLength": 2,
+      "maxLength": 100
+    }
+  }
+}

@@ -1,0 +1,55 @@
+.city-search-container {
+  position: relative;
+  width: 100%;
+}
+
+.city-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+  z-index: 1000;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.city-option {
+  padding: 8px;
+  cursor: pointer;
+  border-bottom: 1px solid #eee;
+}
+
+.city-option:hover {
+  background-color: #f5f5f5;
+}
+
+.city-option:last-child {
+  border-bottom: none;
+}
+
+.loading-indicator {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #666;
+  font-size: 12px;
+}
+
+.hs-input {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+.hs-input:focus {
+  outline: none;
+  border-color: #0091ae;
+  box-shadow: 0 0 0 2px rgba(0,145,174,0.2);
+} 
